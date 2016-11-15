@@ -4,9 +4,11 @@ import (
 	"fmt"
 	"log"
 
+	"github.com/hashicorp/terraform/helper/resource"
 	"github.com/hashicorp/terraform/helper/schema"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/monitoring/v3"
+	"time"
 )
 
 func resourceMonitoringGroup() *schema.Resource {
@@ -22,6 +24,13 @@ func resourceMonitoringGroup() *schema.Resource {
 				Type:     schema.TypeString,
 				Optional: true,
 				ForceNew: true,
+				Computed: true,
+			},
+
+			"Name": &schema.Schema{
+				Type:     schema.TypeString,
+				Optional: true,
+				Computed: true,
 			},
 
 			"displayName": &schema.Schema{
@@ -55,7 +64,7 @@ func getGroup(d *schema.ResourceData, config *Config) (*monitoring.Group, error)
 	group, err := call.Do()
 	if err != nil {
 		if gerr, ok := err.(*googleapi.Error); ok && gerr.Code == 404 {
-			log.Printf("[WARN] Removing Group %q because it's gone", d.Get("name").(string))
+			log.Printf("[WARN] Removing Group %q because it's gone", d.Get("displayName").(string))
 			// The resource doesn't exist anymore
 			id := d.Id()
 			d.SetId("")
@@ -63,10 +72,50 @@ func getGroup(d *schema.ResourceData, config *Config) (*monitoring.Group, error)
 			return nil, fmt.Errorf("Resource %s no longer exists", id)
 		}
 
-		return nil, fmt.Errorf("Error reading instance: %s", err)
+		return nil, fmt.Errorf("Error reading group: %s", err)
 	}
 
 	return group, nil
+}
+
+func findGroup(d *schema.ResourceData, config *Config) (*monitoring.Group, error) {
+	var res *monitoring.ListGroupsResponse = nil
+	var listParam string = ""
+
+	// Determine if we're in a pagination recursion
+	nextPageToken, ok := d.GetOk("nextPageToken")
+	if !ok {
+		project, err := getProject(d, config)
+		if err != nil {
+			return nil, err
+		}
+		listParam = fmt.Sprintf("projects/%s", project)
+	} else {
+		listParam = nextPageToken.(string)
+	}
+	query := config.clientMonitoring.Projects.Groups.List(listParam)
+	// If a parent is configured set that on the query
+	v, ok := d.GetOk("parentName")
+	if ok {
+		query.ChildrenOfGroup(v.(string))
+	}
+	res, err := query.Do()
+	if err != nil {
+		return nil, err
+	}
+
+	// Check every group on this page for a matching display name
+	for _, element := range res.Group {
+		if element.DisplayName == d.Get("displayName") {
+			return element, nil
+		}
+	}
+	// If there's a next page token we'll need to recurse
+	if res.NextPageToken != "" {
+		d.Set("nextPageToken", res.NextPageToken)
+		return findGroup(d, config)
+	} // No next page, done checking and not found.
+	return nil, nil
 }
 
 func resourceMonitoringGroupCreate(d *schema.ResourceData, meta interface{}) error {
@@ -104,26 +153,44 @@ func resourceMonitoringGroupCreate(d *schema.ResourceData, meta interface{}) err
 		return err
 	}
 
-	d.SetId(res.Name)
+	// Wait until it's created
+	wait := resource.StateChangeConf{
+		Delay:          2 * time.Second,
+		Pending:        []string{"BUILDING"},
+		Target:         []string{"DONE"},
+		Timeout:        2 * time.Minute,
+		MinTimeout:     1 * time.Second,
+		NotFoundChecks: 5,
+		Refresh: func() (interface{}, string, error) {
+			status := "BUILDING"
+			group, err := findGroup(d, config)
+			if err != nil {
+				log.Printf("[ERROR] Failed to get group: %s", err)
+			}
+			if group != nil {
+				status = "DONE"
+			}
+			return group, status, err
+		},
+	}
 
-	return nil
+	_, err = wait.WaitForState()
+	if err != nil {
+		return err
+	}
+
+	d.SetId(res.Name)
+	d.Set("Name", res.Name)
+
+	return resourceMonitoringGroupRead(d, meta)
 }
 
 func resourceMonitoringGroupRead(d *schema.ResourceData, meta interface{}) error {
 	config := meta.(*Config)
 
-	call := config.clientMonitoring.Projects.Groups.Get(d.Id())
-	_, err := call.Do()
+	_, err := getGroup(d, config)
 	if err != nil {
-		if gerr, ok := err.(*googleapi.Error); ok && gerr.Code == 404 {
-			// The resource doesn't exist anymore
-			log.Printf("[WARN] Removing monitoring group %q because it's gone", d.Get("name").(string))
-			d.SetId("")
-
-			return nil
-		}
-
-		return fmt.Errorf("Error reading monitoring group: %s", err)
+		return fmt.Errorf("Error getting group: %s", err)
 	}
 
 	return nil
@@ -134,29 +201,46 @@ func resourceMonitoringGroupUpdate(d *schema.ResourceData, meta interface{}) err
 
 	group, err := getGroup(d, config)
 
+	// Enable partial mode for the resource since it is possible
+	d.Partial(true)
+
+	if d.HasChange("displayName") {
+		if v, ok := d.GetOk("displayName"); ok {
+			group.DisplayName = v.(string)
+		}
+	}
+
+	if d.HasChange("filter") {
+		if v, ok := d.GetOk("filter"); ok {
+			group.Filter = v.(string)
+		}
+	}
+
+	if d.HasChange("isCluster") {
+		if v, ok := d.GetOk("isCluster"); ok {
+			group.IsCluster = v.(bool)
+		}
+	}
+
 	call := config.clientMonitoring.Projects.Groups.Update(group.Name, group)
 	_, err = call.Do()
 	if err != nil {
 		return err
 	}
 
-	return nil
+	// We made it, disable partial mode
+	d.Partial(false)
+
+	return resourceMonitoringGroupRead(d, meta)
 }
 
 func resourceMonitoringGroupDelete(d *schema.ResourceData, meta interface{}) error {
 	config := meta.(*Config)
 
-	project, err := getProject(d, config)
+	log.Print("[DEBUG] monitoring group delete request")
+	_, err := config.clientMonitoring.Projects.Groups.Delete(d.Id()).Do()
 	if err != nil {
-		return err
-	}
-
-	// Delete the image
-	log.Printf("[DEBUG] monitoring group delete request")
-	_, err = config.clientCompute.Images.Delete(
-		project, d.Id()).Do()
-	if err != nil {
-		return fmt.Errorf("Error deleting image: %s", err)
+		return fmt.Errorf("Error deleting group: %s", err)
 	}
 
 	d.SetId("")
